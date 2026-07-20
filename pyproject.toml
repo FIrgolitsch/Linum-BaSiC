@@ -138,7 +138,7 @@ convention = "numpy"
     "N806",  # algorithm uses conventional uppercase math variable names
 ]
 "linum_basic/core.py" = ["N806"]  # math variable names (Ib, Ir, D) mirror _alm.py convention
-"linum_basic/backend.py" = ["N806"]  # V is a conventional math variable in DCT algorithms
+"linum_basic/backend/_torch.py" = ["N806"]  # V / Vc / V_r / V_i / A are conventional math variables in DCT algorithms
 "scripts/**" = ["D", "ANN"]  # CLI scripts; docstrings and annotations optional
 
 [tool.ruff.lint.isort]
@@ -165,7 +165,19 @@ possibly-unresolved-reference = "error"
 # Optional GPU dep — not installed in the standard dev env.
 # Using replace-imports-with-any so downstream attribute/subscript access
 # on the imported module is typed as Any rather than causing cascading errors.
-replace-imports-with-any = ["torch.**"]
+replace-imports-with-any = [
+    "torch.**",
+    # The following first-party modules are added by later pull requests in the
+    # incremental chain. They are imported lazily (inside method/test bodies) so
+    # runtime is unaffected, but ty statically resolves them here. Each entry
+    # becomes a no-op once the corresponding module lands in the stacked PRs:
+    #   linum_basic._alm       -> pr-port-alm-core
+    #   linum_basic.fit        -> pr-fit
+    #   linum_basic.io.zarr    -> pr-io-viz-data
+    "linum_basic._alm",
+    "linum_basic.fit",
+    "linum_basic.io.zarr",
+]
 
 # --- ty overrides ---
 

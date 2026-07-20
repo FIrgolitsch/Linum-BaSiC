@@ -195,14 +195,17 @@ jobs:
 
       # Transitional gate: tests/ lands in S05. Skip the entire vignette
       # pipeline (install, run, upload, ci-artifacts push, PR comment) until
-      # the test files exist — every downstream step is gated on this output.
+      # the vignette test file exists — every downstream step is gated on
+      # this output. NOTE: gating on tests/test_vignette_validation.py (not
+      # just tests/) because the incremental library-PR chain introduces a
+      # partial tests/ dir before the vignette test lands.
       - name: Check tests exist
         id: tests_check
         run: |
-          if [ -d tests ]; then
+          if [ -f tests/test_vignette_validation.py ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::tests/ not present — skipping vignette validation (foundation-only tree)"
+            echo "::notice::tests/test_vignette_validation.py not present — skipping vignette validation (partial tests/ tree)"
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
