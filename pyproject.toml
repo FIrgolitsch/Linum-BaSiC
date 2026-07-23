@@ -79,9 +79,15 @@ notebooks = [
 basicpy = ["basicpy>=2.0"]
 
 [tool.uv]
-# basicpy 2.0.0 pins scipy<1.13; linum-basic requires scipy>=1.15. Override only for BaSiCPy resolution.
+# basicpy 2.0.0 pins scipy<1.13; linum-basic itself needs scipy>=1.15.
+# uv's override-dependencies only accepts flat PEP 508 requirement strings,
+# not a per-package-scoped table (confirmed: the previous form here failed
+# `uv sync` with "invalid type: map, expected a string containing a PEP 508
+# requirement"). This overrides scipy project-wide instead -- the same
+# pattern linumpy's own pyproject.toml already uses to resolve this exact
+# basicpy/linum-basic conflict.
 override-dependencies = [
-    { package = { name = "basicpy" }, dependencies = ["scipy>=1.15"] },
+    "scipy>=1.15",
 ]
 
 [project.scripts]
