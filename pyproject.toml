@@ -137,6 +137,7 @@ convention = "numpy"
 "linum_basic/_alm.py" = [
     "N806",  # algorithm uses conventional uppercase math variable names
 ]
+"linum_basic/_alm_device.py" = ["N806"]  # same math variable names as _alm.py (D, W, T, C)
 "linum_basic/core.py" = ["N806"]  # math variable names (Ib, Ir, D) mirror _alm.py convention
 "linum_basic/backend/_torch.py" = ["N806"]  # V / Vc / V_r / V_i / A are conventional math variables in DCT algorithms
 "scripts/**" = ["D", "ANN"]  # CLI scripts; docstrings and annotations optional

@@ -24,7 +24,8 @@ import numpy as np
 from scipy.fft import dctn
 from tqdm.auto import tqdm
 
-from linum_basic._alm import inexact_alm_l1
+from linum_basic._alm import _warn_convergence_once, inexact_alm_l1
+from linum_basic._alm_device import AlmProblem, AlmResult, read_alm_solver
 from linum_basic.backend import Backend, get_xp
 
 if TYPE_CHECKING:
@@ -44,6 +45,10 @@ GPU_MIN_ELEMENTS: int = 1_000_000
 # :func:`linum_basic.tuning.tune`.
 DEFAULT_L_S_DIVISOR = 800.0
 DEFAULT_L_D_DIVISOR = 2000.0
+
+# Below this many source pixels a stack is resized in the calling thread: the
+# thread pool costs more than it saves on small tiles.
+_RESIZE_PARALLEL_MIN_PIXELS = 32_000_000
 
 
 def dct_energy(mean_image: NDArray) -> float:
@@ -224,6 +229,30 @@ class BaSiC:
         self.darkfield_fullsize: NDArray = np.zeros((1, 1), dtype=np.float32)
         self._alm_state: dict | None = None  # warm-start state for outer reweighting
         self._prepared: bool = False
+        # Device-resident solver state (Torch backend); None on the NumPy path.
+        self._problem: AlmProblem | None = None
+        self._last_result: AlmResult | None = None
+        self._last_ib_mean: float = 0.0
+        self._host: dict[str, NDArray] = {}
+
+    # ------------------------------------------------------------------
+    # Host views of the solver arrays
+    # ------------------------------------------------------------------
+    # On the NumPy path the sorted stack is a plain array. On the device path
+    # it lives on the device and is copied to the host only when read here.
+    # The working arrays ``_W``, ``_Ir`` and ``_Ib`` exist on the NumPy path
+    # only; the device path keeps them inside ``_problem``.
+
+    @property
+    def img_sort(self) -> NDArray:
+        """Working-size stack sorted along the image axis, shape ``(N, ws, ws)``."""
+        if "img_sort" not in self._host and self._problem is not None:
+            self._host["img_sort"] = self._problem.sorted_stack_numpy()
+        return self._host["img_sort"]
+
+    @img_sort.setter
+    def img_sort(self, value: NDArray) -> None:
+        self._host["img_sort"] = value
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -291,13 +320,23 @@ class BaSiC:
         resized = np.zeros([self.n_images, *new_shape], dtype=np.float32)
 
         # Parallel resizing: cv2.resize releases the GIL; each worker writes
-        # to an independent row of the pre-allocated output array.
-        def _resize_one(i: int) -> None:
-            img = self.img_stack[i].squeeze()
-            resized[i] = cv2.resize(img.T, new_shape, interpolation=interp).T
+        # to independent rows of the pre-allocated output array.  Images are
+        # handed out in contiguous chunks, because one task per image costs
+        # more in dispatch than a small resize takes.  Small stacks (the usual
+        # mosaic-tile case) are resized inline.
+        def _resize_range(bounds: tuple[int, int]) -> None:
+            for i in range(*bounds):
+                img = self.img_stack[i].squeeze()
+                resized[i] = cv2.resize(img.T, new_shape, interpolation=interp).T
 
-        with ThreadPoolExecutor(max_workers=min(32, self.n_images)) as pool:
-            list(pool.map(_resize_one, range(self.n_images)))
+        source_pixels = self.n_images * int(np.prod(self.image_shape))
+        n_chunks = min(32, self.n_images) if source_pixels >= _RESIZE_PARALLEL_MIN_PIXELS else 1
+        if n_chunks <= 1:
+            _resize_range((0, self.n_images))
+        else:
+            edges = np.linspace(0, self.n_images, n_chunks + 1, dtype=int)
+            with ThreadPoolExecutor(max_workers=n_chunks) as pool:
+                list(pool.map(_resize_range, zip(edges[:-1].tolist(), edges[1:].tolist(), strict=True)))
 
         self.img_stack_resized = resized
 
@@ -338,8 +377,6 @@ class BaSiC:
         if self.l_d is None:
             self.l_d = dct_sum / DEFAULT_L_D_DIVISOR
 
-        self.img_sort = np.sort(self.img_stack_resized, axis=0)
-
         # Size-based GPU routing: if "auto" selected a GPU but the stack is too
         # small for GPU to be beneficial, fall back to NumPy.  An explicit
         # backend choice (e.g. backend="torch") is always respected.
@@ -353,9 +390,19 @@ class BaSiC:
         self.darkfield = np.zeros((ws, ws), dtype=np.float32)
         self.flatfield_fullsize = np.ones(self.image_shape, dtype=np.float32)
         self.darkfield_fullsize = np.zeros(self.image_shape, dtype=np.float32)
-        self._W: NDArray = np.ones_like(self.img_sort)
-        self._Ir: NDArray = np.zeros_like(self.img_sort)
-        self._Ib: NDArray = np.zeros_like(self.img_sort)
+        self._host = {}
+        self._problem = None
+        self._last_result = None
+        self._last_ib_mean = 0.0
+        if self._xp._backend is not Backend.NUMPY and read_alm_solver() == "device":
+            # Sort on the device and keep the stack there for every reweighting
+            # pass; the host arrays above are only materialised if someone reads them.
+            self._problem = AlmProblem.from_numpy(self._xp, self.img_stack_resized, sort=True)
+        else:
+            self.img_sort = np.sort(self.img_stack_resized, axis=0)
+            self._W: NDArray = np.ones_like(self.img_sort)
+            self._Ir: NDArray = np.zeros_like(self.img_sort)
+            self._Ib: NDArray = np.zeros_like(self.img_sort)
         self._flag_reweighting = True
         self.reweighting_iteration = 0
         self._alm_state: dict | None = None  # reset warm-start state
@@ -375,6 +422,11 @@ class BaSiC:
         The weight is then renormalised so the effective L1 penalty
         magnitude is preserved across reweighting iterations.
         """
+        if self._problem is not None:
+            if self._last_result is not None:
+                self._problem.reweight(self._last_result, self._last_ib_mean, self.epsilon)
+            self.reweighting_iteration += 1
+            return
         denom = np.abs(self._Ir / (self._Ib.mean() + 1e-6)) + self.epsilon
         self._W = 1.0 / denom
         self._W = self._W * self._W.size / self._W.sum()
@@ -394,6 +446,11 @@ class BaSiC:
         if self.l_s is None or self.l_d is None:
             msg = "l_s and l_d must be set before calling update(); call prepare() first."
             raise RuntimeError(msg)
+        if self._problem is not None:
+            ib_mean_image, darkfield_ws = self._alm_pass_on_device(self._problem)
+            self.update_weights()
+            self._finish_update(ib_mean_image, darkfield_ws, last_flatfield, last_darkfield)
+            return
         need_state = self.warm_start_reweighting
         result = inexact_alm_l1(
             self.img_sort,
@@ -418,10 +475,53 @@ class BaSiC:
         D_2d = D.reshape(self.working_size, self.working_size)
 
         self.update_weights()
+        self._finish_update(Ib.mean(axis=0), D_2d, last_flatfield, last_darkfield)
 
-        self.flatfield = Ib.mean(axis=0) - D_2d
+    def _alm_pass_on_device(self, problem: AlmProblem) -> tuple[NDArray, NDArray]:
+        """Run one ALM pass on the device and return ``(mean(Ib, axis=0), dark-field)`` on the host.
+
+        Only these two working-size images leave the device; the stack, the
+        weights and the residual stay there for the next pass.
+        """
+        assert self.l_s is not None and self.l_d is not None
+        xp = self._xp
+        ws = self.working_size
+        pbar: tqdm | None = tqdm(desc="ALM Iteration", total=self.alm_max_iter, leave=False) if self.verbose else None
+        result = problem.solve(
+            self.l_s,
+            self.l_d,
+            estimate_darkfield=self.estimate_darkfield,
+            max_iter=self.alm_max_iter,
+            warm_start=self._alm_state if self.warm_start_reweighting else None,
+            check_every=10 if self.convergence_check_every is None else self.convergence_check_every,
+            pbar=pbar,
+        )
+        if pbar is not None:
+            pbar.close()
+        if result.iterations == self.alm_max_iter:
+            _warn_convergence_once("scalar", "Maximum ALM iterations reached without full convergence.")
+        self.last_alm_iterations = int(result.iterations)
+        if self.warm_start_reweighting:
+            self._alm_state = {"Sf": result.sf, "B": result.b, "D_field": result.d_field}
+        with xp.inference_mode():
+            ib_image = result.ib_mean_image()
+            self._last_ib_mean = float(ib_image.mean())
+        self._last_result = result
+        ib_mean_image = xp.to_numpy(ib_image).reshape(ws, ws).copy()
+        darkfield_ws = xp.to_numpy(result.d_field).reshape(ws, ws).copy()
+        return ib_mean_image, darkfield_ws
+
+    def _finish_update(
+        self,
+        ib_mean_image: NDArray,
+        darkfield_ws: NDArray,
+        last_flatfield: NDArray,
+        last_darkfield: NDArray,
+    ) -> None:
+        """Set the fields from one ALM pass and decide whether to reweight again."""
+        self.flatfield = ib_mean_image - darkfield_ws
         self.flatfield = self.flatfield / (self.flatfield.mean() + 1e-9)
-        self.darkfield = D_2d
+        self.darkfield = darkfield_ws
 
         mad_flat = float(np.abs(self.flatfield - last_flatfield).sum() / (np.abs(last_flatfield).sum() + 1e-9))
         mad_dark_abs = float(np.abs(self.darkfield - last_darkfield).sum())

@@ -92,8 +92,10 @@ def seam_l1(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
         idx_b = np.array([sp.idx_b for sp in group])
         sl_a = group[0].slice_a  # all seams in the group share identical slices
         sl_b = group[0].slice_b
-        a = tiles[idx_a][:, sl_a[0], sl_a[1]].reshape(len(group), -1)
-        b = tiles[idx_b][:, sl_b[0], sl_b[1]].reshape(len(group), -1)
+        # Slice the overlap strip first, then gather: gathering whole tiles
+        # copies several times more data than the strips that are compared.
+        a = tiles[:, sl_a[0], sl_a[1]][idx_a].reshape(len(group), -1)
+        b = tiles[:, sl_b[0], sl_b[1]][idx_b].reshape(len(group), -1)
         local = (np.abs(a) + np.abs(b)).mean(axis=1) / 2.0
         rels.append(np.abs(a - b).mean(axis=1) / (local + 1e-9))
 
@@ -138,8 +140,8 @@ def seam_pearson(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
         idx_b = np.array([sp.idx_b for sp in group])
         sl_a = group[0].slice_a
         sl_b = group[0].slice_b
-        a = tiles[idx_a][:, sl_a[0], sl_a[1]].astype(np.float64).reshape(len(group), -1)
-        b = tiles[idx_b][:, sl_b[0], sl_b[1]].astype(np.float64).reshape(len(group), -1)
+        a = tiles[:, sl_a[0], sl_a[1]][idx_a].astype(np.float64).reshape(len(group), -1)
+        b = tiles[:, sl_b[0], sl_b[1]][idx_b].astype(np.float64).reshape(len(group), -1)
         # Per-seam Pearson via manual formula (avoids calling corrcoef in a loop)
         a_c = a - a.mean(axis=1, keepdims=True)
         b_c = b - b.mean(axis=1, keepdims=True)

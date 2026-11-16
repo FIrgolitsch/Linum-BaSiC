@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import warnings
 from collections.abc import Callable, Sequence
+from typing import cast
 
 from linum_basic._torch_cache import _cuda_joblib_worker_init, collect_cuda_worker_env
 
@@ -34,6 +35,7 @@ __all__ = [
     "parallel_map",
     "parallel_map_cuda_devices",
     "resolve_workers",
+    "thread_map_cuda_devices",
 ]
 
 
@@ -277,3 +279,95 @@ def parallel_map_cuda_devices[T, R](
         )
     pairs.sort(key=lambda pair: pair[0])
     return [value for _, value in pairs]
+
+
+def thread_map_cuda_devices[T, R](
+    fn: Callable[[T, str], R],
+    items: Sequence[T],
+    devices: Sequence[str],
+    *,
+    desc: str | None = None,
+    verbose: bool = False,
+) -> list[R]:
+    """Map *fn(item, device)* over *items* with one thread per device.
+
+    Every device runs one thread, and the threads take items from a shared
+    queue.  A device that is slower, for instance because another job is
+    using it, ends up with fewer items instead of holding up half of them.
+    Use this only when *fn* is thread-safe on distinct devices (eager Torch
+    code is; a ``torch.compile``-d function is not).
+
+    Order is preserved: ``result[i]`` corresponds to ``items[i]``.
+
+    Parameters
+    ----------
+    fn : callable
+        ``fn(item, device) -> result``; *device* is one of *devices*.
+    items : sequence
+        Work items (one per z-level tile stack).
+    devices : sequence of str
+        Device strings, e.g. ``["cuda:0", "cuda:1"]``.
+    desc : str or None
+        Progress-bar label when *verbose*.
+    verbose : bool
+        Show a :mod:`tqdm` progress bar.
+
+    Returns
+    -------
+    list
+        Results in input order.
+
+    Raises
+    ------
+    Exception
+        The first exception raised by *fn*, after the other threads stopped
+        taking new items.
+    """
+    import queue
+    import threading
+
+    items = list(items)
+    devs = list(devices)
+    if not items:
+        return []
+
+    pbar = None
+    if verbose:
+        from tqdm.auto import tqdm
+
+        pbar = tqdm(desc=desc, total=len(items), leave=False)
+
+    todo: queue.SimpleQueue[int] = queue.SimpleQueue()
+    for index in range(len(items)):
+        todo.put(index)
+    results: list[R | None] = [None] * len(items)
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def _drain(device: str) -> None:
+        while not errors:
+            try:
+                index = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                value = fn(items[index], device)
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+                return
+            results[index] = value
+            if pbar is not None:
+                with lock:
+                    pbar.update()
+
+    threads = [threading.Thread(target=_drain, args=(dev,), daemon=True) for dev in devs[: len(items)]]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if pbar is not None:
+        pbar.close()
+    if errors:
+        raise errors[0]
+    return cast("list[R]", results)

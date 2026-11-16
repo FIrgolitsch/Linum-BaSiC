@@ -26,7 +26,14 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
-from linum_basic._parallel import list_cuda_devices, parallel_map, parallel_map_cuda_devices, resolve_workers
+from linum_basic._alm_device import read_alm_solver
+from linum_basic._parallel import (
+    list_cuda_devices,
+    parallel_map,
+    parallel_map_cuda_devices,
+    resolve_workers,
+    thread_map_cuda_devices,
+)
 from linum_basic._working_size import (
     PREVIEW_Z_SAMPLE,
     WorkingSizeResolution,
@@ -705,7 +712,13 @@ def fit_mosaic(
         elif use_cuda_fanout:
             convergence_per_z = []
             cuda_fit = partial(_fit_one_z_cuda_map, params=params, n_extra_rows=n_extra_rows)
-            results = parallel_map_cuda_devices(
+            # The device-resident solver is eager, so one thread per GPU in this
+            # process is enough: no worker start-up, no pickling of tile stacks,
+            # and a busy GPU simply takes fewer z-levels from the shared queue.
+            # The legacy solver may compile its step, which is not thread-safe,
+            # so it keeps one process per GPU.
+            fan_out = thread_map_cuda_devices if read_alm_solver() == "device" else parallel_map_cuda_devices
+            results = fan_out(
                 cuda_fit,
                 tile_stacks,
                 cuda_devices,
@@ -791,7 +804,7 @@ def apply_fit(
     # Materialise to ndarray: no-op for eager MosaicGrid, required read for a
     # lazy (zarr.Array-backed) grid.  apply_fit always needs the full volume
     # since it corrects every pixel.
-    corrected = np.asarray(mosaic.array).astype(np.float32).copy()
+    corrected = np.asarray(mosaic.array).astype(np.float32)  # astype copies: one private array
 
     for z in range(nz):
         if fit.field_mode == "global":
@@ -803,13 +816,14 @@ def apply_fit(
             df = fit.darkfields[pos]
 
         # View the (H, W) plane as a (nrows, th, ncols, tw) tile grid and apply
-        # the (th, tw) fields to every tile at once via broadcasting.
+        # the (th, tw) fields to every tile at once via broadcasting, in place.
         view = corrected[z].reshape(nrows, th, ncols, tw)
-        view[...] = (view - df[None, :, None, :]) / (ff[None, :, None, :] + epsilon)
+        if np.any(df):
+            np.subtract(view, df[None, :, None, :], out=view)
+        np.divide(view, ff[None, :, None, :] + np.float32(epsilon), out=view)
         if n_extra_rows > 0:
             first_valid = view[:, n_extra_rows : n_extra_rows + 1, :, :]
             view[:, :n_extra_rows, :, :] = first_valid
-        corrected[z] = view.reshape(nrows * th, ncols * tw)
 
     return corrected
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from collections import OrderedDict
 from typing import Any
 
@@ -68,6 +69,7 @@ _IDCT_TWIDDLE_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 # regions (Torchinductor cannot generate Triton code for complex ops).
 # Bounded by LRU eviction (see ``_DCT_CACHE_MAXSIZE``).
 _DCT_MATRIX_CACHE: OrderedDict[tuple, Any] = OrderedDict()
+_DCT_MATRIX_LOCK = threading.Lock()
 
 
 def clear_dct_caches() -> None:
@@ -139,16 +141,19 @@ def _get_dct_matrix(n: int, device: Any) -> Any:
     import torch
 
     key = (n, str(device))
-    if key not in _DCT_MATRIX_CACHE:
-        k = torch.arange(n, dtype=torch.float64, device=device)
-        i = torch.arange(n, dtype=torch.float64, device=device)
-        A = torch.cos(math.pi * (i[None, :] + 0.5) * k[:, None] / n)
-        A[0] *= 1.0 / math.sqrt(n)
-        A[1:] *= math.sqrt(2.0 / n)
-        _lru_put(_DCT_MATRIX_CACHE, key, A)
-    else:
-        _DCT_MATRIX_CACHE.move_to_end(key)
-    return _DCT_MATRIX_CACHE[key]
+    # Fits may run in one thread per device; keep lookup, insert and LRU
+    # eviction of the shared cache atomic.
+    with _DCT_MATRIX_LOCK:
+        if key not in _DCT_MATRIX_CACHE:
+            k = torch.arange(n, dtype=torch.float64, device=device)
+            i = torch.arange(n, dtype=torch.float64, device=device)
+            A = torch.cos(math.pi * (i[None, :] + 0.5) * k[:, None] / n)
+            A[0] *= 1.0 / math.sqrt(n)
+            A[1:] *= math.sqrt(2.0 / n)
+            _lru_put(_DCT_MATRIX_CACHE, key, A)
+        else:
+            _DCT_MATRIX_CACHE.move_to_end(key)
+        return _DCT_MATRIX_CACHE[key]
 
 
 def _get_dct_twiddles(n: int, dtype: Any, device: Any) -> tuple:

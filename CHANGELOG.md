@@ -2,6 +2,16 @@
 
 All notable user-facing changes to linum-basic are documented here.
 
+## Unreleased
+
+### Performance
+
+- **Device-resident solver for the Torch backend.** The per-pixel sort, the weights and every reweighting pass now stay on the device; only the working-size flat-field and dark-field come back to the host. The ALM iteration carries the multiplier in scaled form and no longer forms the residual inside the loop, so it reads and writes the large arrays about seven times instead of about twenty-five. A per-z mosaic fit of 16 planes of 496 tiles at working size 128 takes about 3 s on one RTX A6000, down from about 19 s, with flat-fields equal to within 3e-5.
+- The solver is eager, so nothing is compiled when a process starts, and results no longer depend on whether the step was compiled: the compiled step enabled TF32 matmul and its flat-fields differed from the eager ones by up to 3 %.
+- **Multi-GPU fits use one thread per GPU** in the calling process, taking z-levels from a shared queue, instead of one worker process per GPU.
+- `apply_fit` corrects the volume in place on one private copy; seam metrics gather the overlap strips instead of whole tiles; small tile stacks are resized without a thread pool.
+- Set `LINUM_BASIC_ALM_SOLVER=legacy` to run the previous Torch step (optionally compiled). The NumPy backend is unchanged.
+
 ## 2.0.0 — Performance and maturity release
 
 This release delivers faster per-z mosaic fitting, a clearer GPU backend policy, structured library warnings, and stronger documentation and CI coverage. Version remains **2.0.0**; no PyPI publish is included in this milestone summary.

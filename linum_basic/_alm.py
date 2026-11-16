@@ -396,6 +396,26 @@ def inexact_alm_l1(
     if xp is None:
         xp = get_xp(Backend.NUMPY)
 
+    if xp._backend is not Backend.NUMPY:
+        from linum_basic._alm_device import read_alm_solver
+
+        if read_alm_solver() == "device":
+            return _inexact_alm_l1_device(
+                imgs,
+                l_s,
+                l_d,
+                tol=tol,
+                max_iter=max_iter,
+                weight=weight,
+                estimate_darkfield=estimate_darkfield,
+                rho=rho,
+                verbose=verbose,
+                xp=xp,
+                warm_start=warm_start,
+                return_state=return_state,
+                convergence_check_every=convergence_check_every,
+            )
+
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
@@ -531,6 +551,78 @@ def inexact_alm_l1(
     else:
         state = None
 
+    return Ib_np, Ir_np, D_field_np, state
+
+
+def _inexact_alm_l1_device(
+    imgs: np.ndarray,
+    l_s: float,
+    l_d: float,
+    *,
+    tol: float,
+    max_iter: int,
+    weight: np.ndarray | float,
+    estimate_darkfield: bool,
+    rho: float,
+    verbose: bool,
+    xp: ArrayNamespace,
+    warm_start: dict | None,
+    return_state: bool,
+    convergence_check_every: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict | None]:
+    """Run :func:`inexact_alm_l1` through the device-resident solver.
+
+    Same inputs and outputs as the generic path. The host arrays ``Ib`` and
+    ``Ir`` are materialised only here, for callers of the function API;
+    :class:`~linum_basic.core.BaSiC` drives the solver directly and never
+    needs them.
+    """
+    from linum_basic._alm_device import AlmProblem
+
+    n, p, q = imgs.shape
+    problem = AlmProblem.from_numpy(xp, imgs)
+    problem.set_weights(weight)
+    warm: dict[str, Any] | None = None
+    if warm_start is not None:
+        warm = {
+            "Sf": xp.asarray(np.asarray(warm_start["Sf"], dtype=np.float32).reshape(p, q)),
+            "B": xp.asarray(np.asarray(warm_start["B"], dtype=np.float32).reshape(n, 1)),
+            "D_field": xp.asarray(np.asarray(warm_start["D_field"], dtype=np.float32).reshape(1, p * q)),
+        }
+    pbar: tqdm | None = tqdm(desc="ALM Iteration", total=max_iter, leave=False) if verbose else None
+    result = problem.solve(
+        l_s,
+        l_d,
+        tol=tol,
+        max_iter=max_iter,
+        estimate_darkfield=estimate_darkfield,
+        rho=rho,
+        warm_start=warm,
+        check_every=10 if convergence_check_every is None else convergence_check_every,
+        pbar=pbar,
+    )
+    if pbar is not None:
+        pbar.close()
+    if result.iterations == max_iter:
+        _warn_convergence_once(
+            "scalar",
+            "Maximum ALM iterations reached without full convergence.",
+        )
+
+    Ir_np = xp.to_numpy(problem.residual(result)).reshape(n, p, q).copy()
+    with xp.inference_mode():
+        ib = result.ib() if result.iterations > 0 else xp.zeros_like(problem.D)
+    Ib_np = xp.to_numpy(ib).reshape(n, p, q)
+    D_field_np = xp.to_numpy(result.d_field)
+    state: dict | None = None
+    if return_state:
+        state = {
+            "Sf": xp.to_numpy(result.sf).astype(np.float32),
+            "Ir": Ir_np.copy(),
+            "B": xp.to_numpy(result.b).astype(np.float32),
+            "D_field": D_field_np.copy(),
+            "alm_iterations": int(result.iterations),
+        }
     return Ib_np, Ir_np, D_field_np, state
 
 

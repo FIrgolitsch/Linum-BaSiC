@@ -51,6 +51,7 @@ _SKIP_OBJECTS: frozenset[str] = frozenset(
         "linum_basic.benchmark.strategies.AutoStrategyResult.__init__",
         "linum_basic._working_size.WorkingSizeContext.__init__",
         "linum_basic._working_size.WorkingSizeResolution.__init__",
+        "linum_basic._alm_device.AlmResult.__init__",
         "linum_basic.benchmark.profile.HistoricalBaseline.__init__",
         "linum_basic.benchmark.audit.TraceabilityRow.__init__",
         "linum_basic.benchmark.audit.AuditFinding.__init__",
