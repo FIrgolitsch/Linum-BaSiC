@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from linum_basic._alm_device import read_alm_solver
 from linum_basic._parallel import list_cuda_devices
 
 BUILTIN_STRATEGIES: tuple[str, ...] = ("baseline", "sequential", "multi", "batched")
@@ -38,6 +39,8 @@ REASON_POLICY_PHASE2_WS128_MANDATORY = "POLICY_PHASE2_WS128_MANDATORY"
 REASON_AUTO_WS64_SINGLE_Z_SEQUENTIAL = "AUTO_WS64_SINGLE_Z_SEQUENTIAL"
 REASON_AUTO_WS64_BATCHED_CUDA = "AUTO_WS64_BATCHED_CUDA"
 REASON_AUTO_WS64_BATCHED_CUDA_MULTI_GPU = "AUTO_WS64_BATCHED_CUDA_MULTI_GPU"
+REASON_AUTO_SUB128_PER_Z_SEQUENTIAL = "AUTO_SUB128_PER_Z_SEQUENTIAL"
+REASON_AUTO_SUB128_PER_Z_MULTI_GPU_FANOUT = "AUTO_SUB128_PER_Z_MULTI_GPU_FANOUT"
 REASON_CUDA_UNAVAILABLE = "CUDA_UNAVAILABLE"
 REASON_OVERRIDE_USER_KWARGS = "OVERRIDE_USER_KWARGS"
 REASON_OVERRIDE_ENV = "OVERRIDE_ENV"
@@ -70,6 +73,8 @@ __all__ = [
     "DEFAULT_PRODUCTION_WORKING_SIZE",
     "EVIDENCE_POLICY_ID",
     "OVERRIDE_SOURCES",
+    "REASON_AUTO_SUB128_PER_Z_MULTI_GPU_FANOUT",
+    "REASON_AUTO_SUB128_PER_Z_SEQUENTIAL",
     "REASON_AUTO_WS64_BATCHED_CUDA",
     "REASON_AUTO_WS64_BATCHED_CUDA_MULTI_GPU",
     "REASON_AUTO_WS64_SINGLE_Z_SEQUENTIAL",
@@ -308,6 +313,13 @@ def resolve_auto_strategy(
     sequential scalar on one GPU or multi-GPU per-z fan-out on two or more
     visible devices.  Batched at ws≥128 requires explicit override.
 
+    Below that size auto selects the same per-z paths while the Torch backend
+    uses its device-resident solver (the default), which is faster than the
+    batched solver at every working size.  With
+    ``LINUM_BASIC_ALM_SOLVER=legacy`` auto selects batched CUDA below 128 for
+    more than one z-level, as before.  Batched execution remains available
+    through ``strategy="batched"`` or ``force_batched_cuda``.
+
     Parameters
     ----------
     context : WorkloadContext
@@ -442,6 +454,31 @@ def _resolve_auto_base(
             basic_kwargs,
             reason_codes,
             f"Single z-plane at ws={ws}; sequential scalar.",
+        )
+
+    if read_alm_solver() == "device":
+        # The batched solver was chosen here because it beat the generic per-z
+        # step below working size 128.  The device-resident per-z solver is
+        # several times faster than the batched one (16 planes of 496 tiles at
+        # working size 64 on one RTX A6000: 1.1 s against 9.6 s for ten
+        # passes), and it stops each z-level when that level has converged,
+        # where a batch keeps advancing every level until the slowest is done.
+        if context.n_gpus >= 2:
+            basic_kwargs["device"] = "cuda"
+            reason_codes.append(REASON_AUTO_SUB128_PER_Z_MULTI_GPU_FANOUT)
+            return (
+                "multi_gpu_fanout",
+                basic_kwargs,
+                reason_codes,
+                f"ws={ws} with n_z={context.n_z} and {context.n_gpus} GPUs; per-z fan-out with the device solver.",
+            )
+        basic_kwargs["device"] = "cuda:0"
+        reason_codes.append(REASON_AUTO_SUB128_PER_Z_SEQUENTIAL)
+        return (
+            "sequential_scalar",
+            basic_kwargs,
+            reason_codes,
+            f"ws={ws} with n_z={context.n_z}; per-z sequential with the device solver.",
         )
 
     basic_kwargs["force_batched_cuda"] = True

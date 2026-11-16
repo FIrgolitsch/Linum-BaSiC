@@ -245,10 +245,12 @@ def _allow_batched_cuda_for_params(params: dict[str, Any]) -> bool:
     if os.environ.get("LINUM_BASIC_FORCE_BATCHED_CUDA", "0") == "1":
         return True
 
-    # Production linumpy currently uses BaSiC's default working_size=128.
-    # Server benchmarks show this shape is memory-bound: chunking helps peak
-    # memory, but still loses to the scalar per-z CUDA path. Keep the batched
-    # path for lower working sizes where it gives a real throughput win.
+    # The batched solver only ever beat the generic per-z step, and only below
+    # working_size=128 (at 128 it is memory-bound and loses).  The
+    # device-resident per-z solver is faster than the batched one at every
+    # working size, so with it the batched path runs only on request.
+    if read_alm_solver() == "device":
+        return False
     return int(params.get("working_size", 128)) < 128
 
 

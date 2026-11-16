@@ -182,7 +182,7 @@ streaming; no solver internals, DCT kernels, or precision flags change.
 |---|---|
 | Lowest peak memory, any wall-time cost | `--streaming --lazy` |
 | Fastest wall time on multiple GPUs | `--strategy multi` (see {doc}`parallelism`) |
-| Fastest on a single CUDA device | `--strategy auto` / `batched` (see {doc}`gpu`) |
+| Fastest on a single CUDA device | `--strategy auto` (see {doc}`gpu`) |
 | Default, balanced behaviour | (no flags) |
 
 Streaming trades wall time for memory. It is strictly sequential, so it

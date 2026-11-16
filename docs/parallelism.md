@@ -89,15 +89,21 @@ fit = fit_mosaic(mosaic, n_workers=8, basic_kwargs={"backend": "torch", "device"
 ```
 
 **Multiple CUDA devices:** when two or more GPUs are visible,
-{func}`~linum_basic.fit.fit_mosaic` fans out z-level fits across devices via
-{func}`~linum_basic._parallel.parallel_map_cuda_devices` — up to
-``min(n_workers, n_gpus)`` devices in round-robin order. Use
+{func}`~linum_basic.fit.fit_mosaic` fans out z-level fits across devices. With
+the default device-resident solver this is one thread per GPU in the calling
+process ({func}`~linum_basic._parallel.thread_map_cuda_devices`); the threads
+take z-levels from a shared queue, so a GPU that is busy with another job ends
+up with fewer of them. With ``LINUM_BASIC_ALM_SOLVER=legacy`` it is one worker
+process per GPU in round-robin order
+({func}`~linum_basic._parallel.parallel_map_cuda_devices`). Use
 ``--strategy multi`` on the CLI, or let ``strategy="auto"`` select multi-GPU
-when hardware and workload policy allow.
+when two or more devices are visible.
 
 **Batched CUDA:** a separate path stacks multiple z-planes into one batched ALM
-solve on a single device. Select via ``--strategy batched`` or the auto-resolver
-when policy allows (see {doc}`gpu` and ``basic fit --strategy``).
+solve on a single device. Select it with ``--strategy batched``. The
+auto-resolver no longer picks it by default: the device-resident per-z solver
+is faster at every working size. With ``LINUM_BASIC_ALM_SOLVER=legacy`` auto
+still selects it below working size 128 (see {doc}`gpu`).
 
 Apple Silicon MPS is not supported; use ``--backend numpy`` locally or
 ``--device cuda:N`` on CUDA servers.

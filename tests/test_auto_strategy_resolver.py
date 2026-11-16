@@ -14,6 +14,8 @@ from linum_basic.benchmark.strategies import (
     DEFAULT_PRODUCTION_WORKING_SIZE,
     EVIDENCE_POLICY_ID,
     OVERRIDE_SOURCES,
+    REASON_AUTO_SUB128_PER_Z_MULTI_GPU_FANOUT,
+    REASON_AUTO_SUB128_PER_Z_SEQUENTIAL,
     REASON_AUTO_WS128_MULTI_GPU_FANOUT,
     REASON_AUTO_WS128_SINGLE_GPU_SEQUENTIAL,
     REASON_CUDA_UNAVAILABLE,
@@ -189,13 +191,31 @@ class TestAutoDecisionTable:
         assert result.execution_path == "sequential_scalar"
         assert "force_batched_cuda" not in result.basic_kwargs
 
-    def test_ws64_multi_z_single_gpu_batched(self) -> None:
+    def test_ws64_multi_z_single_gpu_per_z(self) -> None:
+        result = resolve_auto_strategy(_ctx(n_z=5, n_gpus=1, working_size=64))
+        assert result.execution_path == "sequential_scalar"
+        assert "force_batched_cuda" not in result.basic_kwargs
+        assert result.basic_kwargs["device"] == "cuda:0"
+        assert REASON_AUTO_SUB128_PER_Z_SEQUENTIAL in result.strategy_metadata["reason_codes"]
+        _assert_metadata_complete(result)
+
+    def test_ws64_multi_z_multi_gpu_per_z_fanout(self) -> None:
+        result = resolve_auto_strategy(_ctx(n_z=5, n_gpus=2, working_size=64))
+        assert result.execution_path == "multi_gpu_fanout"
+        assert "force_batched_cuda" not in result.basic_kwargs
+        assert result.basic_kwargs["device"] == "cuda"
+        assert REASON_AUTO_SUB128_PER_Z_MULTI_GPU_FANOUT in result.strategy_metadata["reason_codes"]
+        _assert_metadata_complete(result)
+
+    def test_ws64_multi_z_single_gpu_batched_with_the_legacy_solver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LINUM_BASIC_ALM_SOLVER", "legacy")
         result = resolve_auto_strategy(_ctx(n_z=5, n_gpus=1, working_size=64))
         assert result.execution_path == "batched_cuda"
         assert result.basic_kwargs["force_batched_cuda"] is True
         assert result.basic_kwargs["device"] == "cuda:0"
 
-    def test_ws64_multi_z_multi_gpu_batched(self) -> None:
+    def test_ws64_multi_z_multi_gpu_batched_with_the_legacy_solver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LINUM_BASIC_ALM_SOLVER", "legacy")
         result = resolve_auto_strategy(_ctx(n_z=5, n_gpus=2, working_size=64))
         assert result.execution_path == "batched_cuda_multi_gpu"
         assert result.basic_kwargs["force_batched_cuda"] is True
@@ -514,6 +534,8 @@ class TestGuardDowngradeMetadata:
         assert fit.params.get("force_batched_cuda") is True
 
     def test_guard_downgrade_recorded_not_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Auto only attempts batched CUDA with the legacy solver, so only then can the guard block it.
+        monkeypatch.setenv("LINUM_BASIC_ALM_SOLVER", "legacy")
         _mock_cuda_gpus_fit(monkeypatch, 1)
         _mock_fast_fit(monkeypatch)
         monkeypatch.setattr("linum_basic.fit.should_use_batched_cuda", lambda **kwargs: True)
@@ -536,6 +558,8 @@ class TestGuardDowngradeMetadata:
         assert REASON_GUARD_WS128_BLOCKED_BATCHED in strat["reason_codes"]
 
     def test_guard_downgrade_multi_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Auto only attempts batched CUDA with the legacy solver, so only then can the guard block it.
+        monkeypatch.setenv("LINUM_BASIC_ALM_SOLVER", "legacy")
         _mock_cuda_gpus_fit(monkeypatch, 2)
         _mock_fast_fit(monkeypatch)
         monkeypatch.setattr("linum_basic.fit.should_use_batched_cuda", lambda **kwargs: True)
@@ -587,18 +611,26 @@ class TestChunkSizeFinalisation:
         )
         assert fit.params["_strategy"]["chunk_size"] is None
 
-    def test_allow_batched_threshold_unchanged(self) -> None:
+    def test_allow_batched_threshold_with_the_legacy_solver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LINUM_BASIC_ALM_SOLVER", "legacy")
         assert _allow_batched_cuda_for_params({"working_size": 128}) is False
         assert _allow_batched_cuda_for_params({"working_size": 64}) is True
         assert _allow_batched_cuda_for_params({"working_size": 128, "force_batched_cuda": True}) is True
 
+    def test_batched_only_on_request_with_the_device_solver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LINUM_BASIC_ALM_SOLVER", raising=False)
+        monkeypatch.delenv("LINUM_BASIC_FORCE_BATCHED_CUDA", raising=False)
+        assert _allow_batched_cuda_for_params({"working_size": 128}) is False
+        assert _allow_batched_cuda_for_params({"working_size": 64}) is False
+        assert _allow_batched_cuda_for_params({"working_size": 64, "force_batched_cuda": True}) is True
+
 
 def _expected_auto_execution_path(*, working_size: int, n_gpus: int, n_z: int) -> str:
-    if working_size >= BATCHED_CUDA_WS_GUARD:
-        return "multi_gpu_fanout" if n_gpus >= 2 else "sequential_scalar"
-    if n_z <= 1:
+    # With the device solver (the default) auto picks a per-z path at every
+    # working size; a single z-level below 128 always runs on one device.
+    if working_size < BATCHED_CUDA_WS_GUARD and n_z <= 1:
         return "sequential_scalar"
-    return "batched_cuda_multi_gpu" if n_gpus >= 2 else "batched_cuda"
+    return "multi_gpu_fanout" if n_gpus >= 2 else "sequential_scalar"
 
 
 def _expected_named_execution_path(*, strategy: str, n_gpus: int) -> str:
@@ -656,12 +688,13 @@ def test_strategy_decision_table(
             n_gpus=n_gpus,
             n_z=n_z,
         )
-        if working_size >= BATCHED_CUDA_WS_GUARD:
-            assert strat["batched_cuda_guard"] is None
-            assert "batched" not in strat["execution_path"]
+        # With the device solver auto never runs the batched path, at any working size.
+        assert strat["batched_cuda_guard"] is None
+        assert "batched" not in strat["execution_path"]
+        if working_size >= BATCHED_CUDA_WS_GUARD or n_z > 1:
+            # (A single z-level below 128 is pinned to cuda:0 by the resolver; the
+            # device mock in this test ignores that, so its path is not checked.)
             assert strat["execution_path"] == expected
-        elif n_z > 1:
-            assert "batched" in strat["execution_path"]
     else:
         assert strat["override_source"] == "strategy_lock"
         if strategy == "sequential":

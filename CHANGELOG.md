@@ -12,6 +12,14 @@ All notable user-facing changes to linum-basic are documented here.
 - `apply_fit` corrects the volume in place on one private copy; seam metrics gather the overlap strips instead of whole tiles; small tile stacks are resized without a thread pool.
 - Set `LINUM_BASIC_ALM_SOLVER=legacy` to run the previous Torch step (optionally compiled). The NumPy backend is unchanged.
 
+### Fixes
+
+- **Dark-field level.** The offset update averaged the bright-minus-dim contrast over the images before fitting a line through it, which left the line with one point: the denominator was zero up to rounding and the estimate landed on its cap, the minimum of the stack, whatever the data said. The contrast is now kept per image, on every backend. On synthetic stacks with a true offset of 0, 8 and 20 the estimate goes from 4.1, 12.1 and 24.1 (the stack minimum each time) to 0.6, 8.8 and 20.8, and it no longer changes when the input is scaled by 1 + 1e-6.
+- **Dark-field convergence.** A dark-field that is zero up to rounding kept the reweighting loop running to `max_reweighting_iterations`, because its change was measured against itself. A dark-field below `darkfield_convergence_floor` (default 1 %) of the mean image intensity is now measured against that fraction of the image level. Set the floor to 0 for the old test.
+- **Matmul precision.** Compiling the ALM step no longer switches the process to TF32 matmul. A compiled single-GPU fit used to converge to flat-fields up to 3 % away from an eager multi-GPU fit of the same data.
+- **Auto strategy below working size 128.** `strategy="auto"` no longer selects the batched solver there; it uses the per-z paths, which are several times faster with the device-resident solver. `strategy="batched"` and `force_batched_cuda` still select it.
+- A compiled dark-field step is no longer reused for a stack with a different minimum (the cap of the offset was fixed when the step was built).
+
 ## 2.0.0 — Performance and maturity release
 
 This release delivers faster per-z mosaic fitting, a clearer GPU backend policy, structured library warnings, and stronger documentation and CI coverage. Version remains **2.0.0**; no PyPI publish is included in this milestone summary.
