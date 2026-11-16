@@ -55,7 +55,35 @@ __all__ = [
 ]
 
 
-def seam_l1(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
+#: A seam strip whose mean absolute level is below this fraction of the mean
+#: absolute level of the tile stack is treated as carrying no signal (see
+#: :func:`seam_l1`).
+EMPTY_SEAM_LEVEL = 1e-3
+
+
+def _seam_strips(tiles: np.ndarray, group: list[SeamPair]) -> tuple[np.ndarray, np.ndarray]:
+    """Return the two overlap strips of every seam in *group* as ``(n_seams, k)`` arrays.
+
+    All seams of one orientation share the same slices, so the strips are cut
+    for all tiles at once and then gathered per seam.  Cutting first matters:
+    gathering whole tiles copies several times more data than is compared.
+    """
+    idx_a = np.array([sp.idx_a for sp in group])
+    idx_b = np.array([sp.idx_b for sp in group])
+    sl_a = group[0].slice_a
+    sl_b = group[0].slice_b
+    a = tiles[:, sl_a[0], sl_a[1]][idx_a].reshape(len(group), -1)
+    b = tiles[:, sl_b[0], sl_b[1]][idx_b].reshape(len(group), -1)
+    return a, b
+
+
+def _seam_groups(seam_pairs: list[SeamPair]) -> list[list[SeamPair]]:
+    """Split *seam_pairs* by orientation, dropping empty groups."""
+    groups = ([sp for sp in seam_pairs if sp.orientation == o] for o in ("horizontal", "vertical"))
+    return [g for g in groups if g]
+
+
+def seam_l1(tiles: np.ndarray, seam_pairs: list[SeamPair], *, empty_level: float = EMPTY_SEAM_LEVEL) -> float:
     """Mean per-seam relative absolute error.
 
     Parameters
@@ -64,13 +92,30 @@ def seam_l1(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
         Tile stack (already corrected).
     seam_pairs : list of SeamPair
         Seam descriptors from :meth:`~linum_basic.mosaic.MosaicGrid.seam_pairs`.
+    empty_level : float
+        A seam is left out when either of its two strips has a mean absolute
+        level below this fraction of the mean absolute level of *tiles*.  Set
+        to ``0`` to keep every seam.
 
     Returns
     -------
     float
-        Mean over seams of ``mean(|a - b|) / (mean((|a| + |b|) / 2) + epsilon)``.
+        Mean over the seams that carry signal of
+        ``mean(|a - b|) / (mean((|a| + |b|) / 2) + epsilon)``.
         Scale-invariant and physical; 0 = perfect agreement.
-        Returns ``nan`` when *seam_pairs* is empty.
+        Returns ``nan`` when *seam_pairs* is empty or no seam carries signal.
+
+    Notes
+    -----
+    A mosaic is usually padded with empty tiles.  A seam needs signal on both
+    sides to say anything about the correction.  Between two empty tiles the
+    relative error is not defined: it is exactly 0 while the tiles are exactly
+    zero, and of order 1 as soon as a dark-field of any size is subtracted
+    from them.  Between an acquired tile and an empty one it is always 2, the
+    largest possible value.  Counted in the mean, the first kind lowers the
+    score in proportion to how much of the mosaic is empty and makes it jump
+    when a dark-field is estimated; the second kind raises it by the length of
+    the border of the acquired region.
     """
     if not seam_pairs:
         return float("nan")
@@ -79,33 +124,24 @@ def seam_l1(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
     if hasattr(tiles, "cpu"):
         tiles = cast(Any, tiles).cpu().numpy()
 
-    # Group by orientation; within each orientation all seams share the same
-    # slice shape, enabling batch extraction into (n_seams, k) arrays.
-    h_pairs = [sp for sp in seam_pairs if sp.orientation == "horizontal"]
-    v_pairs = [sp for sp in seam_pairs if sp.orientation == "vertical"]
-
+    floor = empty_level * float(np.abs(tiles).mean())
     rels: list[np.ndarray] = []
-    for group in (h_pairs, v_pairs):
-        if not group:
-            continue
-        idx_a = np.array([sp.idx_a for sp in group])
-        idx_b = np.array([sp.idx_b for sp in group])
-        sl_a = group[0].slice_a  # all seams in the group share identical slices
-        sl_b = group[0].slice_b
-        # Slice the overlap strip first, then gather: gathering whole tiles
-        # copies several times more data than the strips that are compared.
-        a = tiles[:, sl_a[0], sl_a[1]][idx_a].reshape(len(group), -1)
-        b = tiles[:, sl_b[0], sl_b[1]][idx_b].reshape(len(group), -1)
-        local = (np.abs(a) + np.abs(b)).mean(axis=1) / 2.0
-        rels.append(np.abs(a - b).mean(axis=1) / (local + 1e-9))
+    for group in _seam_groups(seam_pairs):
+        a, b = _seam_strips(tiles, group)
+        level_a = np.abs(a).mean(axis=1)
+        level_b = np.abs(b).mean(axis=1)
+        local = (level_a + level_b) / 2.0
+        rel = np.abs(a - b).mean(axis=1) / (local + 1e-9)
+        rels.append(rel[(level_a > floor) & (level_b > floor)] if empty_level > 0 else rel)
 
     if not rels:
         return float("nan")
-    return float(np.concatenate(rels).mean())
+    merged = np.concatenate(rels)
+    return float(merged.mean()) if merged.size else float("nan")
 
 
-def seam_pearson(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
-    """Mean Pearson correlation across all seam pairs.
+def seam_pearson(tiles: np.ndarray, seam_pairs: list[SeamPair], *, empty_level: float = EMPTY_SEAM_LEVEL) -> float:
+    """Mean Pearson correlation of the two sides of every seam.
 
     Parameters
     ----------
@@ -113,6 +149,10 @@ def seam_pearson(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
         Tile stack (already corrected).
     seam_pairs : list of SeamPair
         Seam descriptors.
+    empty_level : float
+        A seam is left out when either of its strips has a mean absolute level
+        below this fraction of the mean absolute level of *tiles*, as in
+        :func:`seam_l1`.
 
     Returns
     -------
@@ -128,26 +168,20 @@ def seam_pearson(tiles: np.ndarray, seam_pairs: list[SeamPair]) -> float:
     if hasattr(tiles, "cpu"):
         tiles = cast(Any, tiles).cpu().numpy()
 
-    # Group by orientation; same orientation → same overlap shape → batch ops.
-    h_pairs = [sp for sp in seam_pairs if sp.orientation == "horizontal"]
-    v_pairs = [sp for sp in seam_pairs if sp.orientation == "vertical"]
-
+    floor = empty_level * float(np.abs(tiles).mean())
     corrs: list[np.ndarray] = []
-    for group in (h_pairs, v_pairs):
-        if not group:
-            continue
-        idx_a = np.array([sp.idx_a for sp in group])
-        idx_b = np.array([sp.idx_b for sp in group])
-        sl_a = group[0].slice_a
-        sl_b = group[0].slice_b
-        a = tiles[:, sl_a[0], sl_a[1]][idx_a].astype(np.float64).reshape(len(group), -1)
-        b = tiles[:, sl_b[0], sl_b[1]][idx_b].astype(np.float64).reshape(len(group), -1)
+    for group in _seam_groups(seam_pairs):
+        a32, b32 = _seam_strips(tiles, group)
+        a = a32.astype(np.float64)
+        b = b32.astype(np.float64)
         # Per-seam Pearson via manual formula (avoids calling corrcoef in a loop)
         a_c = a - a.mean(axis=1, keepdims=True)
         b_c = b - b.mean(axis=1, keepdims=True)
         std_a = np.sqrt((a_c**2).mean(axis=1))
         std_b = np.sqrt((b_c**2).mean(axis=1))
         valid = (std_a >= 1e-9) & (std_b >= 1e-9)
+        if empty_level > 0:
+            valid &= (np.abs(a).mean(axis=1) > floor) & (np.abs(b).mean(axis=1) > floor)
         if not valid.any():
             continue
         r = (a_c[valid] * b_c[valid]).mean(axis=1) / (std_a[valid] * std_b[valid])

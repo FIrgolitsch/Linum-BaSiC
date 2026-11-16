@@ -404,3 +404,131 @@ class TestEvaluateCorrectionVolume:
         # seam_1minus_pearson: z=1 contributes nan (constant tiles) which is skipped;
         # z=0 and z=2 have random data → finite mean
         assert np.isfinite(result["seam_1minus_pearson"])
+
+
+# ---------------------------------------------------------------------------
+# Ground truth: tiles cut from one image with a known overlap
+# ---------------------------------------------------------------------------
+
+
+def _mosaic_from_scene(
+    *,
+    th: int = 20,
+    tw: int = 30,
+    nrows: int = 4,
+    ncols: int = 5,
+    overlap_fraction: float = 0.2,
+    cut_overlap: tuple[int, int] | None = None,
+    seed: int = 0,
+) -> MosaicGrid:
+    """Cut overlapping tiles from one smooth-plus-texture scene and pack them edge to edge.
+
+    *cut_overlap* is the overlap in pixels ``(y, x)`` the tiles are really cut
+    with; by default it is what ``overlap_fraction`` implies, so the two
+    strips of every seam show exactly the same scene pixels.
+    """
+    oy = round(overlap_fraction * th) if cut_overlap is None else cut_overlap[0]
+    ox = round(overlap_fraction * tw) if cut_overlap is None else cut_overlap[1]
+    step_y, step_x = th - oy, tw - ox
+    rng = np.random.default_rng(seed)
+    height, width = step_y * (nrows - 1) + th, step_x * (ncols - 1) + tw
+    yy, xx = np.mgrid[:height, :width]
+    scene = 50.0 + 20.0 * np.sin(xx / 7.0) * np.cos(yy / 5.0) + rng.normal(0.0, 4.0, size=(height, width))
+    packed = np.zeros((1, nrows * th, ncols * tw), dtype=np.float32)
+    for r in range(nrows):
+        for c in range(ncols):
+            packed[0, r * th : (r + 1) * th, c * tw : (c + 1) * tw] = scene[
+                r * step_y : r * step_y + th, c * step_x : c * step_x + tw
+            ]
+    return MosaicGrid(array=packed, tile_shape=(th, tw), overlap_fraction=overlap_fraction)
+
+
+class TestSeamGeometryGroundTruth:
+    """The strips the metrics compare are the ones that image the same scene."""
+
+    def test_exact_overlap_scores_perfectly(self):
+        mosaic = _mosaic_from_scene()
+        tiles = mosaic.iter_tiles(0)
+        pairs = mosaic.seam_pairs()
+        # 4 rows x 4 horizontal seams + 3 x 5 vertical seams
+        assert len(pairs) == 4 * 4 + 3 * 5
+        assert seam_l1(tiles, pairs) == pytest.approx(0.0, abs=1e-7)
+        assert seam_pearson(tiles, pairs) == pytest.approx(1.0, abs=1e-6)
+
+    @pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+    def test_each_orientation_alone_scores_perfectly(self, orientation):
+        mosaic = _mosaic_from_scene()
+        pairs = [sp for sp in mosaic.seam_pairs() if sp.orientation == orientation]
+        assert seam_l1(mosaic.iter_tiles(0), pairs) == pytest.approx(0.0, abs=1e-7)
+
+    def test_a_wrong_overlap_is_penalised(self):
+        # Tiles really overlap by two pixels more than the mosaic is told.
+        mosaic = _mosaic_from_scene(cut_overlap=(6, 8))
+        tiles = mosaic.iter_tiles(0)
+        pairs = mosaic.seam_pairs()
+        assert seam_l1(tiles, pairs) > 0.05
+        assert seam_pearson(tiles, pairs) < 0.95
+
+    def test_a_vignette_is_penalised_and_its_removal_is_not(self):
+        mosaic = _mosaic_from_scene()
+        tiles = mosaic.iter_tiles(0)
+        pairs = mosaic.seam_pairs()
+        th, tw = mosaic.tile_shape
+        yy, xx = np.mgrid[:th, :tw]
+        vignette = (1.0 - 0.4 * ((xx / (tw - 1) - 0.5) ** 2 + (yy / (th - 1) - 0.4) ** 2)).astype(np.float32)
+        shaded = tiles * vignette[None]
+        assert seam_l1(shaded, pairs) > 5 * seam_l1(shaded / vignette[None], pairs) + 1e-3
+        assert seam_l1(shaded / vignette[None], pairs) == pytest.approx(0.0, abs=1e-5)
+
+
+class TestSeamsWithoutSignal:
+    """Seams between empty tiles do not enter the score."""
+
+    @staticmethod
+    def _with_empty_tiles() -> tuple[np.ndarray, list, np.ndarray]:
+        mosaic = _mosaic_from_scene(nrows=4, ncols=6)
+        packed = np.array(mosaic.array)
+        th, tw = mosaic.tile_shape
+        packed[0, :, 3 * tw :] = 0.0  # the right half of the grid is padding
+        packed[0] *= np.tile(np.linspace(0.8, 1.2, tw, dtype=np.float32), 6)[None, :]  # leave a real mismatch
+        padded = MosaicGrid(array=packed, tile_shape=(th, tw), overlap_fraction=mosaic.overlap_fraction)
+        tiles = padded.iter_tiles(0)
+        with_signal = np.array([bool(tiles[sp.idx_a].any() and tiles[sp.idx_b].any()) for sp in padded.seam_pairs()])
+        return tiles, padded.seam_pairs(), with_signal
+
+    def test_score_is_the_mean_over_seams_with_signal(self):
+        tiles, pairs, with_signal = self._with_empty_tiles()
+        kept = [sp for sp, keep in zip(pairs, with_signal, strict=True) if keep]
+        assert 0 < len(kept) < len(pairs)
+        assert seam_l1(tiles, pairs) == pytest.approx(seam_l1(tiles, kept), rel=1e-6)
+        assert seam_pearson(tiles, pairs) == pytest.approx(seam_pearson(tiles, kept), rel=1e-6)
+
+    def test_seams_with_one_empty_side_score_two_when_kept(self):
+        tiles, pairs, _ = self._with_empty_tiles()
+        one_sided = [sp for sp in pairs if bool(tiles[sp.idx_a].any()) != bool(tiles[sp.idx_b].any())]
+        assert one_sided
+        assert seam_l1(tiles, one_sided, empty_level=0.0) == pytest.approx(2.0, rel=1e-6)
+        assert np.isnan(seam_l1(tiles, one_sided))
+
+    def test_seams_between_empty_tiles_score_zero_when_kept(self):
+        tiles, pairs, _ = self._with_empty_tiles()
+        both_empty = [sp for sp in pairs if not tiles[sp.idx_a].any() and not tiles[sp.idx_b].any()]
+        assert both_empty
+        assert seam_l1(tiles, both_empty, empty_level=0.0) == 0.0
+        assert np.isnan(seam_l1(tiles, both_empty))
+
+    def test_a_tiny_offset_does_not_change_the_score(self):
+        tiles, pairs, _ = self._with_empty_tiles()
+        tw = tiles.shape[2]
+        offset = (1e-4 * np.linspace(-1.0, 1.0, tw, dtype=np.float32))[None, None, :]
+        shifted = tiles - offset
+        assert seam_l1(shifted, pairs) == pytest.approx(seam_l1(tiles, pairs), rel=1e-4)
+        assert seam_pearson(shifted, pairs) == pytest.approx(seam_pearson(tiles, pairs), abs=1e-4)
+        # Without the exclusion the same offset moves the score.
+        assert abs(seam_l1(shifted, pairs, empty_level=0.0) - seam_l1(tiles, pairs, empty_level=0.0)) > 0.1
+
+    def test_all_seams_empty_gives_nan(self):
+        mosaic = _mosaic_from_scene()
+        tiles = np.zeros_like(mosaic.iter_tiles(0))
+        assert np.isnan(seam_l1(tiles, mosaic.seam_pairs()))
+        assert np.isnan(seam_pearson(tiles, mosaic.seam_pairs()))

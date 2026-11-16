@@ -19,6 +19,7 @@ All notable user-facing changes to linum-basic are documented here.
 - **Matmul precision.** Compiling the ALM step no longer switches the process to TF32 matmul. A compiled single-GPU fit used to converge to flat-fields up to 3 % away from an eager multi-GPU fit of the same data.
 - **Auto strategy below working size 128.** `strategy="auto"` no longer selects the batched solver there; it uses the per-z paths, which are several times faster with the device-resident solver. `strategy="batched"` and `force_batched_cuda` still select it.
 - A compiled dark-field step is no longer reused for a stack with a different minimum (the cap of the offset was fixed when the step was built).
+- **Seam metrics.** `seam_l1` and `seam_pearson` now leave out seams that lack signal on either side (`empty_level`, default 0.1 % of the mean level). A seam between two empty padding tiles used to count as perfect agreement while the tiles were exactly zero and as a full mismatch once any dark-field was subtracted; a seam between an acquired tile and an empty one always scored 2, the maximum. On a mosaic with 24 % empty seams the score of the same correction read 0.30 with dark-field off and 0.47 with it on; it now reads 0.20 in both cases. Scores computed before this change are not comparable. Pass `empty_level=0` for the old behaviour.
 
 ## 2.0.0 — Performance and maturity release
 
