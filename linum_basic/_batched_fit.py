@@ -125,6 +125,9 @@ def fit_stacks_batched(
     warm_start = bool(params.get("warm_start_reweighting", False))
     verbose = bool(params.get("verbose", False))
 
+    dark_floor = (
+        float(params.get("darkfield_convergence_floor", 0.01)) * np.abs(img_sort.mean(axis=1)).mean(axis=(1, 2)) * ws * ws
+    )  # (z,)
     weights = np.ones_like(img_sort, dtype=np.float32)
     flatfields = np.ones((z, ws, ws), dtype=np.float32)
     darkfields = np.zeros((z, ws, ws), dtype=np.float32)
@@ -178,10 +181,12 @@ def fit_stacks_batched(
         mad_flat = np.abs(flatfields - last_ff).sum(axis=(1, 2)) / (np.abs(last_ff).sum(axis=(1, 2)) + 1e-9)
         mad_dark_abs = np.abs(darkfields - last_df).sum(axis=(1, 2))
         last_dark_sum = np.abs(last_df).sum(axis=(1, 2))
+        # A dark-field far below the image level is compared against a fixed
+        # fraction of that level (see BaSiC.darkfield_convergence_floor).
         mad_dark = np.where(
             mad_dark_abs < 1e-7,
             0.0,
-            np.where(last_dark_sum < 1e-7, 1.0, mad_dark_abs / (last_dark_sum + 1e-9)),
+            np.where(last_dark_sum < 1e-7, 1.0, mad_dark_abs / (np.maximum(last_dark_sum, dark_floor) + 1e-9)),
         )
 
         reweight_iter += 1

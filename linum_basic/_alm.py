@@ -127,6 +127,9 @@ def _build_alm_step(
         l_s,
         estimate_darkfield,
         l_d,
+        # The step closes over the dark-field offset cap, which is the minimum
+        # of the stack it was built for.
+        b1_uplimit if estimate_darkfield else None,
         dct_kernel_mode,
         compile_mode,
     )
@@ -214,15 +217,21 @@ def _build_alm_step(
             dminus_ir_valid_rowsum = xp.sum(d_minus_ir * mask_valid_b_f[:, None], axis=0, keepdims=True)
             n_high = xp.sum(mask_high_s_f)
             n_low = xp.sum(mask_low_s_f)
-            r_high = xp.sum(dminus_ir_valid_rowsum * mask_high_s_f[None, :]) / (k_cnt * n_high + 1e-9)
-            r_low = xp.sum(dminus_ir_valid_rowsum * mask_low_s_f[None, :]) / (k_cnt * n_low + 1e-9)
-            b1_cand = (r_high - r_low) / (new_r_mean_all + 1e-9)
+            # Contrast of every image between the bright and the dim half of
+            # the flat-field, relative to the overall level.  The offset is
+            # the baseline at which a line fitted through (baseline, contrast)
+            # crosses zero, so the contrasts must stay one per image: averaged
+            # over the images first, the line has a single point and the
+            # denominator below is zero up to rounding.
+            r_high = xp.sum(d_minus_ir * mask_high_s_f[None, :], axis=1) / (n_high + 1e-9)
+            r_low = xp.sum(d_minus_ir * mask_low_s_f[None, :], axis=1) / (n_low + 1e-9)
+            b1_cand = xp.astype((r_high - r_low) / (new_r_mean_all + 1e-9), np.float32)
             b_flat = xp.astype(new_b[:, 0], np.float32)
             sum_b2 = xp.sum(b_flat**2 * mask_valid_b_f)
             sum_b = xp.sum(b_flat * mask_valid_b_f)
             temp1 = sum_b2
             temp2 = sum_b
-            temp3 = b1_cand * k_cnt
+            temp3 = xp.sum(b1_cand * mask_valid_b_f)
             temp4 = xp.sum(b_flat * b1_cand * mask_valid_b_f)
             denom = temp2 * temp3 - k_cnt * temp4
             b1_new_raw = (temp1 * temp3 - temp2 * temp4) / (denom + 1e-30)
@@ -252,9 +261,10 @@ def _build_alm_step(
             import torch as _torch
 
             if hasattr(_torch, "compile"):
-                # Enable TF32 for float32 matmul: faster on Ampere+ GPUs with
-                # negligible precision loss for the iterative ALM solver.
-                _torch.set_float32_matmul_precision("high")
+                # The float32 matmul precision is left as the caller set it.
+                # Switching it to "high" (TF32) here used to make the compiled
+                # step converge to flat-fields up to 3 % away from the eager
+                # one, and changed the setting for the whole process.
                 compile_kwargs: dict[str, Any] = {"fullgraph": False}
                 if compile_mode != "default":
                     compile_kwargs["mode"] = compile_mode
@@ -713,15 +723,16 @@ def _build_alm_step_batched(
             dminus_ir_valid_rowsum = xp.sum(d_minus_ir * mask_valid_b, axis=1, keepdims=True)  # (z,1,p*q)
             n_high = xp.sum(mask_high_s, axis=2, keepdims=True)  # (z,1,1)
             n_low = xp.sum(mask_low_s, axis=2, keepdims=True)  # (z,1,1)
-            r_high = xp.sum(dminus_ir_valid_rowsum * mask_high_s, axis=2, keepdims=True) / (k_cnt * n_high + 1e-9)
-            r_low = xp.sum(dminus_ir_valid_rowsum * mask_low_s, axis=2, keepdims=True) / (k_cnt * n_low + 1e-9)
-            b1_cand = (r_high - r_low) / (new_r_mean_all + 1e-9)  # (z,1,1)
+            # One contrast per image, as in the scalar step (see there).
+            r_high = xp.sum(d_minus_ir * mask_high_s, axis=2, keepdims=True) / (n_high + 1e-9)  # (z,n,1)
+            r_low = xp.sum(d_minus_ir * mask_low_s, axis=2, keepdims=True) / (n_low + 1e-9)  # (z,n,1)
+            b1_cand = xp.astype((r_high - r_low) / (new_r_mean_all + 1e-9), np.float32)  # (z,n,1)
             b_flat = xp.astype(new_b, np.float32)  # (z,n,1)
             sum_b2 = xp.sum(b_flat**2 * mask_valid_b, axis=1, keepdims=True)  # (z,1,1)
             sum_b = xp.sum(b_flat * mask_valid_b, axis=1, keepdims=True)  # (z,1,1)
             temp1 = sum_b2
             temp2 = sum_b
-            temp3 = b1_cand * k_cnt
+            temp3 = xp.sum(b1_cand * mask_valid_b, axis=1, keepdims=True)  # (z,1,1)
             temp4 = xp.sum(b_flat * b1_cand * mask_valid_b, axis=1, keepdims=True)
             denom = temp2 * temp3 - k_cnt * temp4
             b1_new_raw = (temp1 * temp3 - temp2 * temp4) / (denom + 1e-30)
@@ -750,7 +761,6 @@ def _build_alm_step_batched(
         import torch as _torch
 
         if hasattr(_torch, "compile"):
-            _torch.set_float32_matmul_precision("high")
             fn = _torch.compile(_alm_core_step_batched, mode="default", fullgraph=False)
     except Exception as exc:
         global last_compile_fallback

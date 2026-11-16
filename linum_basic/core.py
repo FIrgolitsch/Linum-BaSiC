@@ -133,6 +133,13 @@ class BaSiC:
     reweighting_tolerance : float
         Convergence threshold for the outer reweighting loop (relative
         change in flat-field and dark-field).  Default ``1e-3``.
+    darkfield_convergence_floor : float
+        Fraction of the mean image intensity below which the dark-field is
+        treated as negligible in the convergence test: its change is then
+        measured against that fraction of the image level instead of against
+        the dark-field itself.  Without this a dark-field that is zero up to
+        rounding keeps the loop running to ``max_reweighting_iterations``.
+        Default ``0.01``; ``0`` restores the purely relative test.
     max_reweighting_iterations : int
         Hard cap on outer reweighting iterations.  Default ``10``.
     alm_max_iter : int
@@ -211,6 +218,7 @@ class BaSiC:
         self.l_s: float | None = None
         self.l_d: float | None = None
         self.reweighting_tolerance: float = 1e-3
+        self.darkfield_convergence_floor: float = 0.01
         self.max_reweighting_iterations: int = 10
         self.alm_max_iter: int = 500
         self.convergence_check_every: int | None = None
@@ -229,6 +237,7 @@ class BaSiC:
         self.darkfield_fullsize: NDArray = np.zeros((1, 1), dtype=np.float32)
         self._alm_state: dict | None = None  # warm-start state for outer reweighting
         self._prepared: bool = False
+        self._intensity_scale: float = 0.0  # mean |intensity| of the working stack
         # Device-resident solver state (Torch backend); None on the NumPy path.
         self._problem: AlmProblem | None = None
         self._last_result: AlmResult | None = None
@@ -371,7 +380,9 @@ class BaSiC:
             self._load_images(self.img_stack)
 
         # Auto-tune regularisation from the DCT of the mean image
-        dct_sum = dct_energy(self.img_stack_resized.mean(axis=0))
+        mean_image = self.img_stack_resized.mean(axis=0)
+        self._intensity_scale = float(np.abs(mean_image).mean())
+        dct_sum = dct_energy(mean_image)
         if self.l_s is None:
             self.l_s = dct_sum / DEFAULT_L_S_DIVISOR
         if self.l_d is None:
@@ -526,12 +537,16 @@ class BaSiC:
         mad_flat = float(np.abs(self.flatfield - last_flatfield).sum() / (np.abs(last_flatfield).sum() + 1e-9))
         mad_dark_abs = float(np.abs(self.darkfield - last_darkfield).sum())
         last_dark_sum = float(np.abs(last_darkfield).sum())
+        # A dark-field far below the image level is numerical noise around
+        # zero, and its change relative to itself never settles.  Compare such
+        # a dark-field against a fixed fraction of the image level instead.
+        dark_floor = self.darkfield_convergence_floor * self._intensity_scale * self.darkfield.size
         if mad_dark_abs < 1e-7:
             mad_dark = 0.0
         elif last_dark_sum < 1e-7:
             mad_dark = 1.0  # previous estimate was zero; relative change is undefined, assume not converged
         else:
-            mad_dark = mad_dark_abs / last_dark_sum
+            mad_dark = mad_dark_abs / max(last_dark_sum, dark_floor)
 
         if (
             max(mad_flat, mad_dark) <= self.reweighting_tolerance

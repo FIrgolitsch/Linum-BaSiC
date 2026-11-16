@@ -366,13 +366,14 @@ class AlmProblem:
                     dminus_ir_valid_rowsum = torch.sum(R * mask_valid_b_f[:, None], dim=0, keepdim=True)
                     n_high = torch.sum(mask_high_s_f)
                     n_low = torch.sum(mask_low_s_f)
-                    r_high = torch.sum(dminus_ir_valid_rowsum * mask_high_s_f[None, :]) / (k_cnt * n_high + 1e-9)
-                    r_low = torch.sum(dminus_ir_valid_rowsum * mask_low_s_f[None, :]) / (k_cnt * n_low + 1e-9)
+                    # One bright-minus-dim contrast per image (see the generic step).
+                    r_high = torch.sum(R * mask_high_s_f[None, :], dim=1) / (n_high + 1e-9)
+                    r_low = torch.sum(R * mask_low_s_f[None, :], dim=1) / (n_low + 1e-9)
                     b1_cand = (r_high - r_low) / (r_mean_all + 1e-9)
                     b_flat = b_new[:, 0]
                     sum_b2 = torch.sum(b_flat**2 * mask_valid_b_f)
                     sum_b = torch.sum(b_flat * mask_valid_b_f)
-                    temp3 = b1_cand * k_cnt
+                    temp3 = torch.sum(b1_cand * mask_valid_b_f)
                     temp4 = torch.sum(b_flat * b1_cand * mask_valid_b_f)
                     denom = sum_b * temp3 - k_cnt * temp4
                     b1_new_raw = (sum_b2 * temp3 - sum_b * temp4) / (denom + 1e-30)

@@ -37,19 +37,6 @@ def _stack(n: int = 24, size: int = 32, *, offset: float = 0.0, seed: int = 0) -
     return stack.astype(np.float32)
 
 
-def _with_empty_image(stack: np.ndarray) -> np.ndarray:
-    """Append an all-zero image, as the empty tiles of a mosaic do.
-
-    The dark-field update caps its ``B1`` offset at ``min(D) / mean(S)``.
-    When the stack has no zero pixel that cap is positive and the offset is
-    decided by the sign of a difference that is zero up to rounding, in the
-    generic step as much as here: scaling the input by ``1 + 1e-6`` moves the
-    generic step's dark-field by more than the two solvers differ.  A zero in
-    the data pins the offset to zero and makes the comparison meaningful.
-    """
-    return np.concatenate([stack, np.zeros_like(stack[:1])], axis=0)
-
-
 def _legacy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Select the generic step, eager, for the reference run."""
     monkeypatch.setenv("LINUM_BASIC_ALM_SOLVER", "legacy")
@@ -109,7 +96,7 @@ class TestParityWithGenericStep:
         assert np.count_nonzero(new.get_darkfield()) == 0
 
     def test_darkfield(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        stack = _with_empty_image(_stack(offset=8.0, seed=3))
+        stack = _stack(offset=8.0, seed=3)
         new = _fit(stack, darkfield=True)
         _legacy(monkeypatch)
         old = _fit(stack, darkfield=True)
@@ -138,7 +125,7 @@ class TestFunctionApi:
     """``inexact_alm_l1`` keeps its outputs when routed through the device solver."""
 
     def _both(self, monkeypatch: pytest.MonkeyPatch, **kwargs: object) -> tuple[tuple, tuple]:
-        stack = np.sort(_with_empty_image(_stack(16, 24)), axis=0)
+        stack = np.sort(_stack(16, 24), axis=0)
         xp = get_xp(Backend.TORCH, "cpu")
         new = inexact_alm_l1(stack, 0.5, 0.2, xp=xp, return_state=True, **kwargs)
         _legacy(monkeypatch)
@@ -283,3 +270,130 @@ class TestChunkedResize:
         threaded.working_size = 32
         threaded.prepare()
         np.testing.assert_array_equal(threaded.img_stack_resized, inline.img_stack_resized)
+
+
+class TestDarkfieldOffset:
+    """The dark-field level follows the data, on every backend."""
+
+    @staticmethod
+    def _run(stack: np.ndarray, backend: str) -> BaSiC:
+        model = BaSiC(stack, backend=backend, estimate_darkfield=True)
+        model.working_size = stack.shape[1]
+        model.run()
+        return model
+
+    @pytest.mark.parametrize("backend", ["numpy", "torch"])
+    @pytest.mark.parametrize("offset", [0.0, 8.0, 20.0])
+    def test_recovers_a_known_offset(self, backend: str, offset: float) -> None:
+        # Images are level * flat + offset with levels from 5 upward, so the
+        # stack minimum sits about 4 above the offset.  The estimate used to
+        # equal that minimum whatever the true offset was.
+        rng = np.random.default_rng(0)
+        size = 48
+        yy, xx = np.mgrid[:size, :size] / (size - 1)
+        flat = 1.0 - 0.5 * ((xx - 0.45) ** 2 + (yy - 0.55) ** 2)
+        level = rng.uniform(5.0, 120.0, size=(60, 1, 1))
+        stack = (level * flat[None] * rng.uniform(0.97, 1.03, size=(60, size, size)) + offset).astype(np.float32)
+        model = self._run(stack, backend)
+        assert abs(float(model.get_darkfield().mean()) - offset) < 1.5
+        assert float(stack.min()) - offset > 3.0
+
+    @pytest.mark.parametrize("backend", ["numpy", "torch"])
+    def test_is_stable_under_a_tiny_change_of_the_input(self, backend: str) -> None:
+        stack = _stack(24, 32, offset=6.0, seed=4)
+        base = self._run(stack, backend)
+        nudged = self._run(stack * np.float32(1.0 + 1e-6), backend)
+        scale = float(stack.mean())
+        assert np.abs(nudged.get_darkfield() - base.get_darkfield()).max() < 1e-3 * scale
+        assert np.abs(nudged.get_flatfield() - base.get_flatfield()).max() < 1e-3
+
+
+class TestDarkfieldConvergence:
+    """A dark-field that is zero up to rounding does not keep the loop running."""
+
+    @staticmethod
+    def _stack_with_empty_images() -> np.ndarray:
+        # Nearly rank-one images plus empty ones, as the empty tiles of a mosaic:
+        # the dark-field comes out four orders of magnitude below the image
+        # level, and its relative change never settles (on Torch-CPU the purely
+        # relative test runs this stack to the pass cap).
+        rng = np.random.default_rng(7)
+        size = 32
+        yy, xx = np.mgrid[:size, :size] / (size - 1)
+        flat = 1.0 - 0.5 * ((xx - 0.45) ** 2 + (yy - 0.55) ** 2)
+        stack = rng.uniform(20.0, 120.0, size=(40, 1, 1)) * flat[None] * rng.uniform(0.995, 1.005, size=(40, size, size))
+        stack[:6] = 0.0
+        return stack.astype(np.float32)
+
+    @pytest.mark.parametrize("backend", ["numpy", "torch"])
+    def test_stops_when_the_flatfield_has_converged(self, backend: str) -> None:
+        stack = self._stack_with_empty_images()
+        flat_only = BaSiC(stack, backend=backend)
+        flat_only.working_size = 32
+        flat_only.max_reweighting_iterations = 60
+        flat_only.run()
+        with_dark = BaSiC(stack, backend=backend, estimate_darkfield=True)
+        with_dark.working_size = 32
+        with_dark.max_reweighting_iterations = 60
+        with_dark.run()
+        assert float(np.abs(with_dark.get_darkfield()).mean()) < 1e-3 * float(stack.mean())
+        assert with_dark.reweighting_iteration <= flat_only.reweighting_iteration + 2
+
+    def test_floor_zero_restores_the_relative_test(self) -> None:
+        stack = self._stack_with_empty_images()
+        model = BaSiC(stack, estimate_darkfield=True)
+        model.working_size = 32
+        model.max_reweighting_iterations = 6
+        model.prepare()
+        model.darkfield_convergence_floor = 0.0
+        last_flat = model.flatfield.copy()
+        last_dark = np.full_like(model.darkfield, 1e-6)
+        # A change as large as the (tiny) previous dark-field counts as not converged.
+        model._finish_update(last_flat * (last_flat.mean() + 1e-9), last_dark * 2.0, last_flat, last_dark)
+        assert model._flag_reweighting is True
+        model.darkfield_convergence_floor = 0.01
+        model._finish_update(last_flat * (last_flat.mean() + 1e-9), last_dark * 2.0, last_flat, last_dark)
+        assert model._flag_reweighting is False
+
+
+class TestMatmulPrecision:
+    """Building or running a solver step leaves the process-wide matmul precision alone."""
+
+    def test_step_builders_do_not_touch_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from linum_basic import _alm
+
+        monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setenv("LINUM_BASIC_ALM_COMPILE_MODE", "default")
+        _alm._ALM_STEP_CACHE.clear()
+        _alm._ALM_STEP_BATCHED_CACHE.clear()
+        before = torch.get_float32_matmul_precision()
+        xp = get_xp(Backend.TORCH, "cpu")
+        _alm._build_alm_step(xp, n=4, p=8, q=8, l_s=0.1)
+        _alm._build_alm_step_batched(xp, z=2, n=4, p=8, q=8)
+        assert torch.get_float32_matmul_precision() == before
+        _alm._ALM_STEP_CACHE.clear()
+        _alm._ALM_STEP_BATCHED_CACHE.clear()
+
+    def test_a_fit_does_not_touch_it(self) -> None:
+        before = torch.get_float32_matmul_precision()
+        _fit(_stack(12, 16))
+        assert torch.get_float32_matmul_precision() == before
+
+
+class TestStepCache:
+    def test_darkfield_step_is_not_reused_for_a_stack_with_another_minimum(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from linum_basic import _alm
+
+        _legacy(monkeypatch)
+        _alm._ALM_STEP_CACHE.clear()
+        xp = get_xp(Backend.TORCH, "cpu")
+        first = _alm._build_alm_step(xp, n=4, p=8, q=8, l_s=0.1, estimate_darkfield=True, l_d=0.1, b1_uplimit=1.0)
+        second = _alm._build_alm_step(xp, n=4, p=8, q=8, l_s=0.1, estimate_darkfield=True, l_d=0.1, b1_uplimit=5.0)
+        again = _alm._build_alm_step(xp, n=4, p=8, q=8, l_s=0.1, estimate_darkfield=True, l_d=0.1, b1_uplimit=1.0)
+        assert first is not second
+        assert first is again
+        # Without dark-field the cap is unused and the step is shared.
+        plain_a = _alm._build_alm_step(xp, n=4, p=8, q=8, l_s=0.1, b1_uplimit=1.0)
+        plain_b = _alm._build_alm_step(xp, n=4, p=8, q=8, l_s=0.1, b1_uplimit=5.0)
+        assert plain_a is plain_b
+        _alm._ALM_STEP_CACHE.clear()
